@@ -166,17 +166,28 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
+    """
+    注意力机制 todo：czl
+    """
     def __init__(self, args: MiniMindConfig):
         super().__init__()
+        # Key/Value 的头数，例如8
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        # Query 的头数，例如32
         assert args.num_attention_heads % self.num_key_value_heads == 0
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
+        # 每个 KV 头要被重复多少次才能匹配 Q 头
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 每个头的维度
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # QKV 投影层
+        # Q: [batch_size, seq_len, hidden_size] → [batch_size, seq_len, Query的头数 × head_dim]
+        # K/V: [batch_size, seq_len, hidden_size] → [batch_size, seq_len, Key/Value的头数 × head_dim]
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # o: 把多头拼接后的输出 线程回 hidden_size
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
@@ -190,13 +201,17 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
+        # x: [batch_size, seq_len, hidden_size]
         bsz, seq_len, _ = x.shape
+        # QKV投影得到公式里的QKV矩阵
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 将 Q、K、V 拆分成多头，维度为 (batch_size, seq_len, n_head, dim // n_head)，
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
+        # 交换维度，变成 (batch_size, n_head, seq_len, dim // n_head)
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # kv_cache实现
@@ -205,6 +220,7 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
+        # 计算公式
         xq, xk, xv = (
             xq.transpose(1, 2),
             repeat_kv(xk, self.n_rep).transpose(1, 2),
@@ -225,16 +241,23 @@ class Attention(nn.Module):
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
+            # softmax
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
+        # 恢复时间维度并合并头。
+        # 将多头的结果拼接起来, 先交换维度为 (batch_size, seq_len, n_head, dim // n_head)，再拼接成 (batch_size, seq_len, n_head * dim // n_head)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # 最终投影回残差流
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
 
 class FeedForward(nn.Module):
+    """
+    前馈神经网络FNN
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         if config.intermediate_size is None:
@@ -247,13 +270,13 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        # 输入的x是 [batch_size, seq_len, hidden_size] 的张量
-        # 输出的结果是 [batch_size, seq_len, hidden_size] 的张量
-        # 门控投影gate_proj(x) 维度：[B, L, 768] → [B, L, 2048]
-        # 激活函数 act_fn(gate_proj(x))  # 维度保持 [B, L, 2048]
-        # 升维投影 up_proj(x)  维度：[B, L, 768] → [B, L, 2048]
-        # 降维投影 down_proj(x)  维度：[B, L, 2048] → [B, L, 768]
-        # dropout 维度保持 [B, L, 768]
+        # 输入的x是 [batch_size, seq_len, hidden_size]
+        # 维度升维转换 gate_proj(x) 维度：[batch_size, seq_len, hidden_size] → [batch_size, seq_len, intermediate_size]
+        # 激活函数 act_fn(gate_proj(x))  # 维度保持 [batch_size, seq_len, intermediate_size]
+        # 维度升维转换 up_proj(x)  维度：[batch_size, seq_len, hidden_size] → [batch_size, seq_len, intermediate_size]
+        # 维度降维转换 down_proj(x)  维度：[batch_size, seq_len, intermediate_size] → [batch_size, seq_len, hidden_size]
+        # dropout 维度保持 [batch_size, seq_len, hidden_size]
+        # 输出的结果是 [batch_size, seq_len, hidden_size]
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 
@@ -448,7 +471,7 @@ class MiniMindModel(nn.Module):
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        # input_ids → [B, L] → embed_tokens → [B, L, H] → dropout → 仍是 [B, L, H]
+        # input_ids → [batch_size, seq_len] → embed_tokens → [batch_size, seq_len, hidden_size] → dropout → 仍是 [batch_size, seq_len, hidden_size]
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
         # 准备位置编码
