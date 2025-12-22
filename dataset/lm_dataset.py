@@ -33,15 +33,28 @@ class PretrainDataset(Dataset):
         encoding = self.tokenizer(
             str(sample['text']),
             max_length=self.max_length,
+            # 填充到最大长度
             padding='max_length',
+            # 截断
             truncation=True,
+            # 返回 pytorch tensor
             return_tensors='pt'
         )
+        # input_ids, 例如 [101, 200, 201, 102, 0, 0]
         input_ids = encoding.input_ids.squeeze()
+        # 损失掩码，因为前4个 token 是真实内容，后2个是填充的padding。例如 [True, True, True, True, False, False]
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
+        # X[0]=101 → 应预测 Y[0]=200
+        # X[1]=200 → 应预测 Y[1]=201
+        # X[2]=201 → 应预测 Y[2]=102
+        # X[3]=102 → 应预测 Y[3]=0
+        # X[4]=0 → 应预测 Y[4]=0
+        # 去除最后一个表示模型的输入, 例如 [101, 200, 201, 102, 0]
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
+        # 去除第一个表示真实标签, 例如 [200, 201, 102, 0, 0]
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        # 对齐预测位置并转long类型，例如 [1, 1, 1, 0, 0]
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
         return X, Y, loss_mask
 

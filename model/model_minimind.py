@@ -40,19 +40,33 @@ class MiniMindConfig(PretrainedConfig):
             **kwargs
     ):
         super().__init__(**kwargs)
+        #所有 dropout 层（如 attention、MLP）的dropout概率
         self.dropout = dropout
+        # tokenizer 起始token ID
         self.bos_token_id = bos_token_id
+        # tokenizer 结束token ID
         self.eos_token_id = eos_token_id
+        # 激活函数，默认 silu
         self.hidden_act = hidden_act
+        # 隐藏层维度（神经元的数量），即d_model
         self.hidden_size = hidden_size
+        # Transformer 中前馈神经网络的维度
         self.intermediate_size = intermediate_size
+        # 最大位置编码
         self.max_position_embeddings = max_position_embeddings
+        # 多头的数量
         self.num_attention_heads = num_attention_heads
+        # 隐藏层的数量
         self.num_hidden_layers = num_hidden_layers
+        # KV 头数
         self.num_key_value_heads = num_key_value_heads
+        # 词表大小
         self.vocab_size = vocab_size
+        # RMSNorm 层的eps
         self.rms_norm_eps = rms_norm_eps
+        # RoPE Theta
         self.rope_theta = rope_theta
+        # 推理时是否使用RoPE缩放
         self.inference_rope_scaling = inference_rope_scaling
         # 外推长度 = factor * original_max_position_embeddings = 32768
         self.rope_scaling = {
@@ -63,6 +77,7 @@ class MiniMindConfig(PretrainedConfig):
             "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None
+        # 是否使用 Flash Attention
         self.flash_attn = flash_attn
         ####################################################
         # Here are the specific configurations of MOE
@@ -97,12 +112,15 @@ class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
+        # 缩放系数
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
+        # RMS(x) 公式
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 强制转为 float32 计算 norm 以保证数值精度，最后再转回 x 的类型 (如 float16)
         return self.weight * self._norm(x.float()).type_as(x)
 
 
@@ -229,6 +247,13 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # 输入的x是 [batch_size, seq_len, hidden_size] 的张量
+        # 输出的结果是 [batch_size, seq_len, hidden_size] 的张量
+        # 门控投影gate_proj(x) 维度：[B, L, 768] → [B, L, 2048]
+        # 激活函数 act_fn(gate_proj(x))  # 维度保持 [B, L, 2048]
+        # 升维投影 up_proj(x)  维度：[B, L, 768] → [B, L, 2048]
+        # 降维投影 down_proj(x)  维度：[B, L, 2048] → [B, L, 768]
+        # dropout 维度保持 [B, L, 768]
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 
@@ -351,6 +376,9 @@ class MOEFeedForward(nn.Module):
 
 
 class MiniMindBlock(nn.Module):
+    """
+    Decoder 第2个和第3个子层
+    """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -359,31 +387,46 @@ class MiniMindBlock(nn.Module):
         self.self_attn = Attention(config)
 
         self.layer_id = layer_id
+        # Attention前的Norm
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # FFN前的Norm
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # FeedForward，可能是普通 FFN 或 MoE
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # x ──► LayerNorm ──► Self-Attention ──► Add ──► LayerNorm ──► FeedForward ──► Add ──► output
+        #       (norm first)    ↑______Residual______↑     (norm first)   ↑____Residual____↑
+        # 先临时保存，后面做残差
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
+            # 先做RMSNorm
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
+        # 做残差连接
         hidden_states += residual
+        # 做Norm + FeedForward，再做残差连接
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
 
 class MiniMindModel(nn.Module):
+    """
+    decoder的主体，包含了 Embedding → N×Block → Final RMSNorm
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
+        # 创建n个 MiniMindBlock
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # RMSNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # 预计算 RoPE（旋转位置编码）所需的 cos/sin 表
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
@@ -396,18 +439,25 @@ class MiniMindModel(nn.Module):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 **kwargs):
+        # input_ids ──► Embedding ──► Dropout  ──► MiniMindBlock 0  ──► MiniMindBlock 1  ──► ... ──► MiniMindBlock N  ──► Final RMSNorm ──► hidden_states(output)
+        #                                               │                      │                         │
+        #                                               ▼                      ▼                         ▼
+        #                                             (K₀, V₀)              (K₁, V₁)         ...      (Kₙ, Vₙ)
+
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-
+        # input_ids → [B, L] → embed_tokens → [B, L, H] → dropout → 仍是 [B, L, H]
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # 准备位置编码
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
+        # 逐层通过 Transformer Blocks
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
@@ -419,25 +469,31 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
 
+        # 最终归一化
         hidden_states = self.norm(hidden_states)
 
+        # MoE 辅助损失, 如果某层用了 MoE（混合专家），其 mlp 会计算一个 负载均衡辅助损失（auxiliary loss），要把所有层的 aux_loss 加起来，供训练时联合优化
         aux_loss = sum(
             layer.mlp.aux_loss
             for layer in self.layers
             if isinstance(layer.mlp, MOEFeedForward)
         )
-
+        # 返回隐藏状态、当前的 (key, value) 缓存？ 和 MoE 辅助损失
         return hidden_states, presents, aux_loss
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
-
+    """
+    完整的因果语言模型, MiniMindModel（Transformer 主干） + LM Head（输出层）
+    """
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # 线程层, 将隐藏状态映射回词表维度 (vocab_size)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享, 让 embedding 层 和 lm_head 层 共享同一组权重矩阵
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(self,
@@ -447,6 +503,13 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        # input_ids ──► [MiniMindModel] ──► hidden_states ──► [LM Head] ──► logits (vocab_size)
+        #                ↑      ↑                ↑
+        #                │      │                └── 可选：只取最后 k 个 token 的 logits
+        #                │      └── 输出: past_key_values（用于下一次推理）
+        #                └── 内部: Embedding → N×Block → Final RMSNorm
+
+        # 调 MiniMindModel
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -454,8 +517,12 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        # 动态截取hidden_states。不需要对整个序列做 lm_head。因为:
+        # 在训练时，通常要计算 所有位置 的 loss（如 [x1,x2,x3] → 预测 [x2,x3,EOF]）
+        # 在推理时，我们只关心 最后一个 token 的预测结果（因为只生成一个新词）
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # 输出结果
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
         return output

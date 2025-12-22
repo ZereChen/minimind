@@ -21,9 +21,11 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    # 交叉熵损失函数
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        # X,Y,loss_mask参考lm_dataset.py的__getitem__
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -33,27 +35,37 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             res = model(X)
+            # Loss计算:
+            # 将 [B, L, V] 和 [B, L] 展平为 [B*L, V] 和 [B*L]，计算交叉熵。
+            # 再 reshape 回 [B, L]，以便应用 loss_mask。
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
-
+            # 只对 mask=1 的位置求平均 → 正确处理变长序列。
             loss = (loss * loss_mask).sum() / loss_mask.sum()
             loss += res.aux_loss
+            # 梯度累积补偿：因为要累积 N 步才更新，所以每步 loss 除以 N，保证总梯度 scale 不变。
             loss = loss / args.accumulation_steps
 
+        # 反向传播（带缩放）
         scaler.scale(loss).backward()
 
+        # 梯度累积到指定步骤了（当 batch size 太大放不下 GPU 时，用小 batch 多次 forward + backward，累积梯度，等效于大 batch），则进行梯度更新
         if (step + 1) % args.accumulation_steps == 0:
+            # 先还原梯度（为 clip 准备）
             scaler.unscale_(optimizer)
+            # 防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
+            # 执行优化（内部会检查 inf/nan）
             scaler.step(optimizer)
+            # 更新 scaler 的缩放因子
             scaler.update()
-
+            # 清空梯度（set_to_none 更省显存）
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
 
+        # 打印日志
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -64,6 +76,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             
             if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
+        # 模型保存
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
