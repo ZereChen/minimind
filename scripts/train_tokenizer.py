@@ -31,6 +31,7 @@ def train_tokenizer():
 
     # 设置训练器并添加特殊token
     trainer = trainers.BpeTrainer(
+        # 词表大小
         vocab_size=6400,
         special_tokens=special_tokens,  # 确保这三个token被包含
         show_progress=True,
@@ -41,6 +42,7 @@ def train_tokenizer():
     texts = read_texts_from_jsonl(data_path)
 
     # 训练tokenizer
+    # 开始训练
     tokenizer.train_from_iterator(texts, trainer=trainer)
 
     # 设置解码器

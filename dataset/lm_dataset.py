@@ -65,7 +65,9 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
+        # <s>assistant的input_id
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        # </s>的input_id
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
     def __len__(self):
@@ -80,6 +82,11 @@ class SFTDataset(Dataset):
         return samples
 
     def _create_chat_prompt(self, cs):
+        """
+        将conversations转换为一个字符串
+        输入：[{"role": "user"...}, {"role": "assistant"...}]
+        输出：<s>user\n1+1=?</s><s>assistant\n2</s>
+        """
         messages = cs.copy()
         tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
         return self.tokenizer.apply_chat_template(
@@ -90,6 +97,10 @@ class SFTDataset(Dataset):
         )
 
     def _generate_loss_mask(self, input_ids):
+        """
+        生成动态损失掩码loss_mask
+        只保留“assistant”部分的 Loss(mask=1)，屏蔽“用户提问”和“特殊标记头”的 Loss(mask=0)
+        """
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
@@ -111,6 +122,9 @@ class SFTDataset(Dataset):
         sample = self.samples[index]
         # 构建对话提示
         prompt = self._create_chat_prompt(sample['conversations'])
+        # 将字符串转为 ID 列表，并用 0 填充到最大长度
+        # 字符串为：<s> user 1+1=? </s> <s> assistant 2 </s>
+        # input_ids：[1, 10, 101, 102, 103, 2, 1, 20, 200, 2, 0, 0, ...]
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 

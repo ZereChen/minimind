@@ -37,7 +37,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             res = model(X)
             # Loss计算:
             # 将 [batch_size, seq_len, V] 和 [batch_size, seq_len] 展平为 [batch_size*seq_len, V] 和 [batch_size*seq_len]，计算交叉熵。
-            # 再 reshape 回 [batch_size, seq_len]，以便应用 loss_mask。
+            # 再投影回 [batch_size, seq_len]，以便应用 loss_mask。
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
