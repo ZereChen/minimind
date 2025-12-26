@@ -34,6 +34,8 @@ def apply_lora(model, rank=8):
 
 def load_lora(model, path):
     state_dict = torch.load(path, map_location=model.device)
+    state_dict = {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
+
     for name, module in model.named_modules():
         if hasattr(module, 'lora'):
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
@@ -44,6 +46,7 @@ def save_lora(model, path):
     state_dict = {}
     for name, module in model.named_modules():
         if hasattr(module, 'lora'):
-            lora_state = {f'{name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
+            clean_name = name[7:] if name.startswith("module.") else name
+            lora_state = {f'{clean_name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
     torch.save(state_dict, path)
