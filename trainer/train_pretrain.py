@@ -157,6 +157,7 @@ if __name__ == "__main__":
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
+        # start_step 表示在这个epoch的第几步停了
         start_step = ckp_data.get('step', 0)
     
     # ========== 7. DDP包模型 ==========
@@ -169,6 +170,7 @@ if __name__ == "__main__":
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
+            # 本 epoch 还剩 多少 个 batch 没有训练（因为前面训练过的被 SkipBatchSampler 跳过了）
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
