@@ -27,6 +27,8 @@ def logits_to_log_probs(logits, labels):
     # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    # 每个 token 在真实序列上的 log-probability，对应 logPi_theta(y|x) 或 logPi_ref(y|x)
+    # log_probs_per_token shape: (batch_size, seq_len)
     return log_probs_per_token
 
 
@@ -34,19 +36,26 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
+    # 对每一个seq 求平均log-probability
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
+    # chosen_ref_log_probs是logPi_ref(y_w|x)
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
+    # reject_ref_log_probs是logPi_ref(y_l|x)
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+    # chosen_policy_log_probs是logPi_theta(y_w|x)
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
+    # reject_policy_log_probs是logPi_theta(y_l|x)
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
+    # 计算公式
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
+    # 计算sigmoid
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 

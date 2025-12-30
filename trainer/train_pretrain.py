@@ -25,7 +25,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        # X,Y,loss_mask参考lm_dataset.py的__getitem__
+        # X,Y,loss_mask参考 lm_dataset.py 的__getitem__
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -35,34 +35,37 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             res = model(X)
-            # Loss计算:
-            # 将 [batch_size, seq_len, V] 和 [batch_size, seq_len] 展平为 [batch_size*seq_len, V] 和 [batch_size*seq_len]，计算交叉熵。
-            # 再投影回 [batch_size, seq_len]，以便应用 loss_mask。
+            # Loss计算
             loss = loss_fct(
+                # 将 logits [batch_size, seq_len, hidden_size]  展平为 [batch_size * seq_len, hidden_size]
                 res.logits.view(-1, res.logits.size(-1)),
+                # 将 Y [batch_size, seq_len] 展平为 [batch_size * seq_len]
                 Y.view(-1)
+                # 计算交叉熵后，再投影回 [batch_size, seq_len]
             ).view(Y.size())
             # 只对 mask=1 的位置求平均 → 正确处理变长序列。
             loss = (loss * loss_mask).sum() / loss_mask.sum()
+            # 加入 MoE 损失
             loss += res.aux_loss
-            # 梯度累积补偿：因为要累积 N 步才更新，所以每步 loss 除以 N，保证总梯度 scale 不变。
+            # 梯度累积补偿：因为要累积 accumulation_steps 步才更新，所以每步 loss 除以 accumulation_steps，保证总梯度 scale 不变。
             loss = loss / args.accumulation_steps
 
-        # 反向传播（带缩放）
+        # 用GradScaler反向传播，计算模型参数的梯度，并累加到 param.grad 中（未更新）
         scaler.scale(loss).backward()
 
-        # 梯度累积到指定步骤了（当 batch size 太大放不下 GPU 时，用小 batch 多次 forward + backward，累积梯度，等效于大 batch），则进行梯度更新
+        # 梯度累积到指定步骤accumulation_steps，则进行梯度更新
         if (step + 1) % args.accumulation_steps == 0:
             # 先还原梯度（为 clip 准备）
             scaler.unscale_(optimizer)
-            # 防止梯度爆炸
+            # 所有参数的梯度进行 L2 范数裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # 执行优化（内部会检查 inf/nan）
+            # 更新梯度
             scaler.step(optimizer)
             # 更新 scaler 的缩放因子
             scaler.update()
-            # 清空梯度（set_to_none 更省显存）
+            # 清空所有参数的梯度
             optimizer.zero_grad(set_to_none=True)
+            # 释放 PyTorch 缓存的未使用的 GPU 显存
             torch.cuda.empty_cache()
 
         # 打印日志
