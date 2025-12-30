@@ -19,16 +19,24 @@ class LoRA(nn.Module):
 
 
 def apply_lora(model, rank=8):
+    """
+    Lora如何注入到现有LLM里
+    将模型中的Linear层替换为LoRA层
+    """
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
+            # 如果是 nn.Linear 且为方阵，则插入 LoRA 模块
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
+            # 给 module 加一个 lora 成员变量
             setattr(module, "lora", lora)
+            # 保存原始 forward
             original_forward = module.forward
 
             # 显式绑定
+            # 构造新 forward：原始输出 + LoRA 输出
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
                 return layer1(x) + layer2(x)
-
+            # 替换 forward
             module.forward = forward_with_lora
 
 

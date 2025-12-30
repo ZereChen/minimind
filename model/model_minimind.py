@@ -198,7 +198,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    注意力机制 todo：czl
+    注意力机制
     """
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -315,7 +315,7 @@ class FeedForward(nn.Module):
 
 class MoEGate(nn.Module):
     """
-    控制每个Token要改交给哪些专家处理
+    控制每个Token要交给哪些专家处理，并计算计算用于负载均衡的辅助损失aux_loss
     使用 Softmax 计算 Token 对每个专家的亲和度分数，选出分数最高的 K 个专家。
     """
     def __init__(self, config: MiniMindConfig):
@@ -330,7 +330,7 @@ class MoEGate(nn.Module):
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
-        # weight的维度是 [n_routed_experts, hidden_size]
+        # weight的维度是 [n_routed_experts, hidden_size] 将输入的hidden_states映射到专家权重
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
         self.reset_parameters()
 
@@ -341,11 +341,12 @@ class MoEGate(nn.Module):
     def forward(self, hidden_states):
         # hidden_states的维度是 [batch_size, seq_len, hidden_size]
         bsz, seq_len, h = hidden_states.shape
-        # 将hidden_states的维度升维为 [batch_size * seq_len, hidden_size]
+        # 将hidden_states的维度降维为 [batch_size * seq_len, hidden_size]
         hidden_states = hidden_states.view(-1, h)
         # hidden_states @ weight^T 所以logits代表每个 token 对每个专家的原始得分，维度是 [batch_size * seq_len, n_routed_experts]
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
+            # scores 维度是 [batch_size * seq_len, n_routed_experts]
             scores = logits.softmax(dim=-1)
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
@@ -360,35 +361,44 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:
-            # 在训练时aux_loss_alpha 加入总 Loss 中，强迫token均匀分配给各个专家，防止“专家负载不均衡”
+            # 在训练时强迫token均匀分配给各个专家，防止“专家负载不均衡”
+            # scores_for_aux 维度是 [batch_size * seq_len, n_routed_experts]
             scores_for_aux = scores
             aux_topk = self.top_k
+            # topk_idx_for_aux_loss是 每个token选择的专家索引，维度是 [batch_size, seq_len * hidden_size]
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
-                # 按 batch 中每个 sequence 单独计算
-                # 在 sequence上 每个专家的分数
+                # Sequence 级负载均衡：不仅仅整个 Batch 要均衡，每个单独的序列（Sequence）内部也要均衡。
+                # scores_for_seq_aux 维度是 [batch_size, seq_len, n_routed_experts], 按 batch 中每个 sequence 单独计算，表示每个 Sequence 中每个Token分配给每个专家的分数
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                # ce 计算每个 sequence 中每个专家被选中的 频率
+                # ce 统计每个 Sequence 中每个专家被选中的次数，ce的维度是 [batch_size, n_routed_experts]
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
-                # 加入总 Loss 中
+                # 计算Loss，按scores_for_seq_aux的seq_len维度求平均, 再跟 ce相乘
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
+                # Batch 级负载均衡
+                # mask_ce 统计每个专家被token选中的情况，ce的维度是 [batch_size, seq_len * hidden_size, n_routed_experts]
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # ce 统计每个专家被选中的次数，ce的维度是 [n_routed_experts]
                 ce = mask_ce.float().mean(0)
+                # Pi：门控网络给给专家 i 分配token的平均概率
                 Pi = scores_for_aux.mean(0)
+                # fi: 实际上有多少 token 被分配给了专家 i
                 fi = ce * self.n_routed_experts
+                # 计算Loss
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
+            # 推理阶段不计算aux_loss
             aux_loss = 0
         return topk_idx, topk_weight, aux_loss
 
 
 class MOEFeedForward(nn.Module):
     """
-    多专家前馈神经网络
+    多专家前馈神经网络，有共享专家和路由分配专家
     """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -410,13 +420,13 @@ class MOEFeedForward(nn.Module):
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
-        # topk_idx是 每个token选择的专家索引，维度是 [batch_size, seq_len, num_experts_per_tok]
-        # topk_weight是 专家权重，维度是 [batch_size, seq_len, num_experts_per_tok]
+        # topk_idx是 每个token选择的TopK专家索引，维度是 [batch_size, seq_len, num_experts_per_tok]
+        # topk_weight是 每个token选择的TopK专家权重，维度是 [batch_size, seq_len, num_experts_per_tok]
         # aux_loss是 辅助损失，鼓励专家负载均衡
         topk_idx, topk_weight, aux_loss = self.gate(x)
         # x的维度是 [batch_size * seq_len, hidden_size]
-        # flat_topk_idx的维度是 [batch_size * seq_len * num_experts_per_tok]
         x = x.view(-1, x.shape[-1])
+        # flat_topk_idx的维度是 [batch_size * seq_len * num_experts_per_tok]
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
             # 训练阶段
@@ -433,24 +443,25 @@ class MOEFeedForward(nn.Module):
             # y的维度转为 [batch_size, seq_len, hidden_size]
             y = y.view(*orig_shape)
         else:
-            # 推理阶段
+            # 推理阶段，代码手动实现了一个循环，根据索引将 Token 分发给对应的专家计算，然后再加权聚合回来。
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         # 处理共享专家
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
         self.aux_loss = aux_loss
+        # 输出结果：共享专家输出 + Σ(路由专家输出 * 权重)
         return y
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         """
-        优化推理函数，高效地计算稀疏激活专家的输出，避免训练时那种对每个专家遍历所有 token 的低效方式
+        优化推理函数，高效地计算稀疏激活专家的输出（推理时不求梯度，且 Batch 可能较小），避免训练时那种对每个专家遍历所有 token 的低效方式。
         """
         # x的维度是 [batch_size * seq_len, hidden_size]
-        # flat_expert_indices的维度是 [batch_size * seq_len * num_experts_per_tok]
-        # flat_expert_weights的维度是 [batch_size * seq_len * num_experts_per_tok]
-        # expert_cache用于累加每个 token 的加权专家输出, 维度是 [batch_size * seq_len, hidden_size]
+        # flat_expert_indices 维度是 [batch_size * seq_len * num_experts_per_tok]
+        # flat_expert_weights 维度是 [batch_size * seq_len * num_experts_per_tok]
+        # expert_cache 用于累加每个 token 的加权专家输出, 维度是 [batch_size * seq_len, hidden_size]
         expert_cache = torch.zeros_like(x)
         # 对专家索引排序
         idxs = flat_expert_indices.argsort()
@@ -467,14 +478,15 @@ class MOEFeedForward(nn.Module):
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
                 continue
-            # 提取第i个专家来处理的x的部分片段
+            # 提取第i个专家以及这个专家要处理的x的部分片段
             expert = self.experts[i]
             exp_token_idx = token_idxs[start_idx:end_idx]
             expert_tokens = x[exp_token_idx]
-            # 开始专家前向 + 加权
+            # 专家开始处理
             expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 专家处理完后加权
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            # 累计到 expert_cache
+            # 结果累计到 expert_cache里
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
 
         return expert_cache
