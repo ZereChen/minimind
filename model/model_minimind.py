@@ -181,16 +181,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     """
-    将K和V的维度扩展到和Q的相同的维度
+    当 Key 和 Value 的头数少于 Query 的头数时，通过重复 K/V 来对齐维度，将K和V的维度扩展到和Q的相同的维度
     """
-    # 批量大小、序列长度、K/V对头的数量、每个头的维度大小
+    # X 维度为 [batch_size, seq_len, Key/Value的头数, head_dim]
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    # 对张量进行扩展和重塑操作以重复键值对
-    # 在第四个维度（头的维度前）添加一个新的维度
-    # 将新添加的维度扩展到n_rep大小，实现重复的效果
-    # 重新塑形，合并键/值对头的数量和重复次数的维度
+    # expand 维度为 [batch_size, seq_len, Key/Value的头数, 新维度n_rep, head_dim]
+    # reshape 的维度为：[batch_size, seq_len, Key/Value的头数 × n_rep, head_dim]
     return (
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
@@ -198,7 +196,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    注意力机制
+    注意力机制 todo:czl 没读完
     """
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -237,8 +235,8 @@ class Attention(nn.Module):
         bsz, seq_len, _ = x.shape
         # 投影得到公式里的QKV矩阵
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        # 将 Q 拆分成多头，维度为 (batch_size, seq_len, Query的头数, head_dim)，
-        # 将 K、V 拆分成多头，维度为 (batch_size, seq_len, Key/Value的头数, head_dim)，
+        # 将 Q 拆分成多头，维度为 [batch_size, seq_len, Query的头数, head_dim]
+        # 将 K、V 拆分成多头，维度为 [batch_size, seq_len, Key/Value的头数, head_dim]
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
@@ -247,13 +245,13 @@ class Attention(nn.Module):
         # 将QK旋转位置
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
-        # kv_cache实现，记录KV缓存
+        # kv_cache实现，记录KV缓存，将当前的K和V拼接到缓存中
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
-        # 计算公式
+        # 扩展 Key 和 Value 头维度
         xq, xk, xv = (
             xq.transpose(1, 2),
             repeat_kv(xk, self.n_rep).transpose(1, 2),
@@ -263,13 +261,20 @@ class Attention(nn.Module):
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
+            # 注意力机制的公式实现：
+            # scores 的维度是 [batch_size, Query的头数, seq_len, seq_len]
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # full 创建一个全 -inf 的(seq_len, seq_len)方阵
+            # triu 创建一个下三角（含对角线）为 0，上三角为 -inf
+            # unsqueeze 增加维度后[1, 1, seq_len, seq_len]
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
 
             if attention_mask is not None:
+                # attention_mask 的维度是 [batch_size, seq_len]
+                # extended_attention_mask 的维度为 [batch_size, 1, 1, seq_len]
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
@@ -277,10 +282,10 @@ class Attention(nn.Module):
             # softmax
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
+            # output 的维度是 [batch_size, Query的头数, seq_len, head_dim]
             output = scores @ xv
 
-        # 恢复时间维度并合并头。
-        # 将多头的结果拼接起来, 先交换维度为 (batch_size, seq_len, n_head, dim // n_head)，再拼接成 (batch_size, seq_len, n_head * dim // n_head)
+        # 将多头的结果拼接起来, 先交换维度为 [batch_size, seq_len, Query的头数, head_dim]，再拼接成 [batch_size, seq_len, Query的头数 * head_dim]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         # 最终投影回残差流
         output = self.resid_dropout(self.o_proj(output))

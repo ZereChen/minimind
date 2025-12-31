@@ -36,7 +36,8 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
-    # 对每一个seq 求平均log-probability
+    # 标准的 DPO 通常使用的是句子总的 Log Probability（即所有 token 的对数概率之和）。
+    # 这里做了一个特殊处理：它除以了序列长度 seq_len。即对每一个seq 求平均log-probability（消除长短句带来的数值差异）
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
