@@ -543,7 +543,7 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        # 创建n个 MiniMindBlock
+        # 创建 self.num_hidden_layers 个 MiniMindBlock
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         # RMSNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
