@@ -427,7 +427,7 @@ python train_xxx.py --use_wandb
 ## Ⅰ Tokenizer
 
 分词器将单词从自然语言通过“词典”映射到`0, 1, 36`这样的数字，可以理解为数字就代表了单词在“词典”中的页码。
-可以选择自己构造词表训练一个“词典”，代码可见`./scripts/train_tokenizer.py`（仅供学习参考，若非必要无需再自行训练，MiniMind已自带tokenizer）。
+可以选择自己构造词表训练一个“词典”，代码可见`./trainer/train_tokenizer.py`（仅供学习参考，若非必要无需再自行训练，MiniMind已自带tokenizer）。
 或者选择比较出名的开源大模型分词器，
 正如同直接用新华/牛津词典的优点是token编码压缩率很好，缺点是页数太多，动辄数十万个词汇短语；
 自己训练的分词器，优点是词表长度和内容随意控制，缺点是压缩率很低（例如"hello"也许会被拆分为"h e l l o"
@@ -939,7 +939,7 @@ MiniMind2第一时间只能坚定不移的选择做蒸馏派，日后基于0.1B�
 这在GRPO中通过设置规则奖励函数约束模型符合思考标签和回复标签（在冷启动靠前的阶段奖励值设置应该提高一些）
 
 另一个问题是蒸馏过程虽然和SFT一样，但实验结果是模型难以每次都符合模板规范的回复，即脱离思考和回复标签约束。
-这里的小技巧是增加标记位置token的损失惩罚，详见`train_distill_reason.py`:
+这里的小技巧是增加标记位置token的损失惩罚，详见`train_reason.py`:
 
 ```text
 # 在 sp_ids 对应的位置增加额外的惩罚
@@ -953,9 +953,9 @@ loss_mask[sp_ids] = 10 # 惩罚系数
 脚本默认基于rlhf后的基模型做推理能力的蒸馏微调，下面直接启动训练即可：
 
 ```bash
-torchrun --nproc_per_node 1 train_distill_reason.py
+torchrun --nproc_per_node 1 train_reason.py
 # or
-python train_distill_reason.py
+python train_reason.py
 ```
 
 > 训练后的模型权重文件默认每隔`100步`保存为: `reason_*.pth`（*为模型具体dimension，每次保存时新文件会覆盖旧文件）
@@ -1665,13 +1665,13 @@ MiniMind模型本身预训练数据集小的可怜，也没有针对性的对测
 
 # 📌 Others
 
-## 模型转换
+## 🔧 模型转换
 
 * [./scripts/convert_model.py](./scripts/convert_model.py)可以实现`torch / transformers`模型的互相转换
 * 如无特别说明，`MiniMind2`模型均默认为`Transformers`格式的模型，需提前`t2t`转换！
 
 
-## 基于MiniMind-API服务接口
+## 🖥️ 基于MiniMind-API服务接口
 
 * [./scripts/serve_openai_api.py](./scripts/serve_openai_api.py)完成了兼容openai-api的最简聊天接口，方便将自己的模型接入第三方UI
   例如FastGPT、OpenWebUI、Dify等等。
@@ -1711,6 +1711,14 @@ MiniMind模型本身预训练数据集小的可怜，也没有针对性的对测
         "stream": true
     }'
     ```
+
+## 👨‍💻 更多
+
+* <a href="https://github.com/jingyaogong/minimind/discussions/618">🔗从MiniMind-LLM微调扩散语言模型</a>
+
+* <a href="https://github.com/jingyaogong/minimind/discussions/611">🔗模型的generate方法说明</a>
+
+---
 
 ## <img src="https://avatars.githubusercontent.com/u/136984999" height="28" style="vertical-align: middle;"/> [vllm](https://github.com/vllm-project/vllm)
 

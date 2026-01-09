@@ -426,7 +426,7 @@ By adding the `--use_wandb` parameter, you can record the training process. Afte
 ## Ⅰ Tokenizer
 
 Tokenizer maps words from natural language to numbers like `0, 1, 36` through a "dictionary," which can be understood as numbers representing the page number of the word in the "dictionary."
-You can choose to construct your own vocabulary table to train a "dictionary." The code can be found in `./scripts/train_tokenizer.py` (for learning reference only. It's not necessary to train one yourself unless required. MiniMind comes with a built-in tokenizer).
+You can choose to construct your own vocabulary table to train a "dictionary." The code can be found in `./trainer/train_tokenizer.py` (for learning reference only. It's not necessary to train one yourself unless required. MiniMind comes with a built-in tokenizer).
 Or you can choose tokenizers from well-known open-source large models.
 Just as using Xinhua/Oxford dictionaries directly has the advantage of good token encoding compression, but the disadvantage of having too many pages—tens of thousands of word phrases;
 A self-trained tokenizer has the advantage of freely controlling vocabulary length and content, but the disadvantage of low compression ratio (for example, "hello" might be split into "h e l l o"
@@ -928,7 +928,7 @@ The reply template for reasoning model R1 is:
 This is constrained by setting a rule-based reward function in GRPO to make the model comply with thinking tags and reply tags (in the early stages of cold starts, reward values should be increased).
 
 Another issue is that although the distillation process is the same as SFT, experimental results show that models have difficulty consistently complying with template-compliant replies every time, i.e., deviating from thinking and reply tag constraints.
-A small trick here is to increase the loss penalty for marker position tokens. See details in `train_distill_reason.py`:
+A small trick here is to increase the loss penalty for marker position tokens. See details in `train_reason.py`:
 
 ```text
 # Add extra penalty to positions corresponding to sp_ids
@@ -942,9 +942,9 @@ Therefore, `r1_mix_1024.jsonl` mixed approximately 10k multi-turn conversations 
 The script defaults to reasoning ability distillation fine-tuning based on the rlhf model. You can directly start training:
 
 ```bash
-torchrun --nproc_per_node 1 train_distill_reason.py
+torchrun --nproc_per_node 1 train_reason.py
 # or
-python train_distill_reason.py
+python train_reason.py
 ```
 
 > After training, model weight files are saved by default every `100 steps` as: `reason_*.pth` (where * is the model's specific dimension, new files overwrite old ones on each save)
@@ -1599,14 +1599,14 @@ Models generally achieve baseline performance due to small parameter scales and 
 
 # 📌 Others
 
-## Model Conversion
+## 🔧 Model Conversion
 
 * [./scripts/convert_model.py](./scripts/convert_model.py) enables mutual conversion of `torch / transformers` models
 * Unless otherwise specified, `MiniMind2` models are by default in `Transformers` format and require `t2t` conversion beforehand!
 
 
 
-## OpenAI-API Based MiniMind Service Interface
+## 🖥️ OpenAI-API Based MiniMind Service Interface
 
 * [./scripts/serve_openai_api.py](./scripts/serve_openai_api.py) provides extremely simple OpenAI-API compatible chat interface, convenient for integration with third-party UIs like FastGPT, Open-WebUI, Dify, etc.
 
@@ -1645,6 +1645,13 @@ Models generally achieve baseline performance due to small parameter scales and 
         "stream": true
     }'
     ```
+
+## 👨‍💻 More
+
+* <a href="https://github.com/jingyaogong/minimind/discussions/618">🔗Fine-tuning Diffusion Language Models from MiniMind-LLM</a>
+* <a href="https://github.com/jingyaogong/minimind/discussions/611">🔗Model generate method explanation</a>
+
+---
 
 ## <img src="https://avatars.githubusercontent.com/u/136984999" height="28" style="vertical-align: middle;"/> [vllm](https://github.com/vllm-project/vllm)
 

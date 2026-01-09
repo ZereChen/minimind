@@ -196,7 +196,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    注意力机制 todo:czl 没读完
+    注意力机制
     """
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -397,7 +397,7 @@ class MoEGate(nn.Module):
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
             # 推理阶段不计算aux_loss
-            aux_loss = 0
+            aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
 
 
@@ -441,7 +441,10 @@ class MOEFeedForward(nn.Module):
             y = torch.empty_like(x, dtype=x.dtype)
             for i, expert in enumerate(self.experts):
                 # 专家开始处理
-                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+                expert_out = expert(x[flat_topk_idx == i])
+                # 确保类型一致
+                if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
             # y的维度转为 [batch_size, seq_len, num_experts_per_tok, hidden_size]
             # 乘以权重topk_weight，再求和
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
@@ -594,13 +597,8 @@ class MiniMindModel(nn.Module):
 
         # 最终归一化
         hidden_states = self.norm(hidden_states)
-
         # MoE 辅助损失, 如果某层用了 MoE（混合专家），其 mlp 会计算一个 负载均衡辅助损失（auxiliary loss），要把所有层的 aux_loss 加起来，供训练时联合优化
-        aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.layers
-            if isinstance(layer.mlp, MOEFeedForward)
-        )
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         # 返回隐藏状态、当前的 (key, value) 缓存？ 和 MoE 辅助损失
         return hidden_states, presents, aux_loss
 

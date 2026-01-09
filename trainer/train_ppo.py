@@ -143,7 +143,11 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
         advantages = rewards - values.detach()  # [B]
 
-        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+        with autocast_ctx:
+            res = actor_model(input_ids=gen_out, attention_mask=full_mask)
+            logits = res.logits  # [B, P+R, V]
+            aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
+        
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
         seq_len = gen_out.size(1) - 1
@@ -167,7 +171,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
         value_loss = F.mse_loss(values, rewards)  # scalar
-        loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
+        loss = (policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
         if (step + 1) % args.accumulation_steps == 0:
@@ -179,7 +183,6 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             critic_scheduler.step()
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
-            torch.cuda.empty_cache()
 
         if is_main_process():
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
@@ -191,6 +194,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
 
             actor_loss_val = policy_loss.item()
             critic_loss_val = value_loss.item()
+            current_aux_loss = aux_loss.item()
             reward_val = rewards.mean().item()
             kl_val = kl.item()
             kl_ref_val = kl_ref.item()
@@ -202,6 +206,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                 wandb.log({
                     "actor_loss": actor_loss_val,
                     "critic_loss": critic_loss_val,
+                    "aux_loss": current_aux_loss,
                     "reward": reward_val,
                     "kl": kl_val,
                     "kl_ref": kl_ref_val,
@@ -209,10 +214,10 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                     "actor_lr": actor_lr,
                 })
 
-            Logger(f"Epoch: {epoch+1}, Step: {step}/{iters}, "
-                   f"Actor Loss: {actor_loss_val:.6f}, Critic Loss: {critic_loss_val:.6f}, "
-                   f"Reward: {reward_val:.6f}, KL: {kl_val:.6f}, KL_ref: {kl_ref_val:.6f}, "
-                   f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}, Critic LR: {critic_lr:.2e}")
+            Logger(f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), "
+                   f"Actor Loss: {actor_loss_val:.4f}, Critic Loss: {critic_loss_val:.4f}, Aux Loss: {current_aux_loss:.4f}, "
+                   f"Reward: {reward_val:.4f}, KL: {kl_val:.4f}, KL_ref: {kl_ref_val:.4f}, "
+                   f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.8f}, Critic LR: {critic_lr:.8f}")
 
         if (step + 1) % args.update_old_actor_freq == 0:
             state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
@@ -237,7 +242,6 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         del enc, gen_out, responses_text, rewards, full_mask, values_seq, values, advantages
         del logits, labels, logp_tokens, final_mask, actor_logp, old_logits, old_logp, ref_logits, ref_logp
         del kl, kl_ref, ratio, surr1, surr2, policy_loss, value_loss, loss
-        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -250,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=1, help="日志打印间隔")
@@ -364,3 +368,6 @@ if __name__ == "__main__":
                               sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model, 
                            actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
+    
+    # ========== 9. 清理分布进程 ==========
+    if dist.is_initialized(): dist.destroy_process_group()
